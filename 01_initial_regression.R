@@ -56,20 +56,33 @@ avg_week_weather <- avg_daily_weather %>%
 
 
 
+first_hundred <- cities_w_covid %>% 
+  group_by(city) %>% 
+  mutate(
+    day_cases = cases - lag(cases)
+  ) %>% 
+  ungroup() %>% 
+  filter(day_cases>=100) %>% 
+  arrange(city,date) %>% 
+  distinct(city,.keep_all = T)
+
 reg_data <- cities_w_covid %>% 
-  filter(date>=as.Date("2020-03-13")) %>% 
   left_join(avg_week_weather %>% select(-contains("day")),
             by = c("city", "date")) %>% 
-  left_join(cities_with_weather %>% distinct(city,pop_density_2016_sq_km)) %>% 
+  left_join(cities_with_weather %>% distinct(city,pop_density_2016_sq_km,land_area_2016_kmmi)) %>% 
+  left_join(first_hundred %>% select(city,first_hundred_date = date),
+            by = "city") %>% 
   group_by(city) %>% 
   mutate(
     day_cases = cases - lag(cases)
     ) %>% 
   ungroup() %>% 
   mutate(
-    log_cases = log(cases),
+    sq_km = as.numeric(gsub("[^0-9.]", "",land_area_2016_kmmi)),
+    log_cases = log(day_cases/sq_km),
     pop_dens_2016 = as.numeric(gsub(",","",gsub("/km2","",pop_density_2016_sq_km)))
-  )
+  ) %>% 
+  filter(date>=first_hundred_date & log_cases>=-100000)
 
 
 
