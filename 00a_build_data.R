@@ -14,6 +14,7 @@ library(lubridate)
 library(rvest)
 library(dplyr)
 library(jsonlite)
+library(httr)
 library(RCurl)
 library(stringr)
 library(riem)  #Data from IOWA Mesonet: https://cran.r-project.org/web/packages/riem/riem.pdf 
@@ -21,8 +22,11 @@ library(geosphere)
 library(sp)
 library(maps)
 library(maptools)
+library(data.table)
+library(janitor)
 
-cities_with_weather <- read_rds("cities_with_weather.rds")
+
+#cities_with_weather <- read_rds("cities_with_weather.rds")
 
 
 
@@ -96,6 +100,10 @@ master_list <- crossing(cities_nest,station_nest)
 distance <- master_list %>% 
   mutate(
     dist = map2_dbl(city_coords, station_coords, distm)) %>% 
+    filter(!(city=="Chicago"&station_id=="CGX") & 
+             !(city=="Durham"&station_id=="IGX") &
+             !(city=="Honolulu[b]"&station_id=="PHIK") &
+             !(city=="Irvine"&station_id=="NZJ")) %>% #Drop Weather station since it doesnt have weather data
     group_by(city) %>% 
     filter(dist == min(dist))
 
@@ -103,7 +111,10 @@ distance <- master_list %>%
 cities_with_station <- clean_cities %>% 
   left_join(distance %>% select(city,closest_station=station_id,dist),
             by="city") %>% 
-  left_join(us_stations %>% select(closest_station = id,station_lat=lat,station_lon=lon))
+  left_join(us_stations %>% select(closest_station = id,station_lat=lat,station_lon=lon)) %>% 
+  mutate(
+    closest_station
+  )
 
 
 
@@ -156,6 +167,12 @@ cities_with_weather <- cities_with_station %>%
 # Pull COVID19 Data -------------------------------------------------------
 
 nyt_covid_county <- read_csv("https://raw.githubusercontent.com/nytimes/covid-19-data/master/us-counties.csv")
+
+# Find first day on which a county had 100 cases:
+first_hundred <- nyt_covid_county %>% 
+  filter(cases>=100) %>% 
+  arrange(date)
+
 
 #Match County Names to City
 
@@ -227,10 +244,144 @@ clean_with_covid <- clean_city_county %>%
     ) %>% 
   select(city,state,county,date,fips,cases,deaths)
 
+# Query AQI API - Archived due to Rate Limiting
+# Data Pulled from: https://docs.airnowapi.org/forecastsbylatlon/query
+
+
+# cities_for_aqi <- clean_cities %>% 
+#   mutate(
+#     aqi_url = paste0("https://www.airnowapi.org/aq/observation/latLong/historical/?format=text/csv&latitude=",as.character(lat),"&longitude=",as.character(lon),"&date=2020-11-09T00-0000&distance=25&API_KEY=5DACE46C-2E9D-4D0E-99F8-C345C952E73A")
+#   ) %>% 
+#   select(
+#     city, aqi_url
+#   )
+# 
+# 
+# 
+# aqi_machine <- function(url){
+#   temp <- GET(url)
+#   
+#   content(temp,"parsed") %>% 
+#     bind_rows() %>% 
+#     mutate_all(.,~as.character(.)) %>% 
+#     mutate(
+#       aqi_url = url
+#     ) %>%
+#     return()
+# }
+# 
+# 
+# combined_aqis <- lapply(cities_for_aqi$aqi_url[1],aqi_machine) %>% 
+#   bind_rows()
+# 
+# 
+# 
+# 
+# clean_with_aqi <- clean_cities %>% 
+#   select(city,lat,lon) %>% 
+#   mutate(
+#     lat = round(lat,2),
+#     lon = round(lon,3)
+#     ) %>% 
+#   left_join(combined_aqis %>% filter(ParameterName=="PM2.5") %>% 
+#               mutate(lat = round(as.numeric(Latitude),3),
+#                      lon = round(as.numeric(Longitude),3)
+#                      ) %>% 
+#               select(aqi_date=DateObserved,aqi=AQI,aqi_parameter=ParameterName,lat,lon),
+#             by=c("lat","lon")
+#             )
+
+
+
+# Match Each city with closest aqi station---------------------
+
+locations_list <- read.table("https://s3-us-west-1.amazonaws.com//files.airnowtech.org/airnow/2020/20200101/HourlyAQObs_2020010123.dat",
+                           sep = ",",
+                           header = TRUE) %>% 
+  clean_names()
+
+
+temp_stations_aqi <- locations_list %>%
+  filter(country_code=="US") %>% 
+  select(aqsid,lon_station = longitude,lat_station=latitude)
+
+cities_nest <- nest(temp_cities,-city, .key = 'city_coords')
+station_nest_aqi <- nest(temp_stations_aqi,-aqsid ,.key = 'station_coords')
+
+
+master_list_aqi <- crossing(cities_nest,station_nest_aqi)
+
+distance_aqi_master <- master_list_aqi %>% 
+  mutate(
+    dist = map2_dbl(city_coords, station_coords, distm))
+
+
+distance_aqi_top3 <- distance_aqi_master %>% 
+  arrange(dist) %>% 
+  group_by(city) %>% 
+  mutate(
+    rank = row_number()
+  ) %>% 
+  ungroup() %>% 
+  filter(rank<=3)
+  
+
+cities_with_station_aqi <- clean_cities %>% 
+  left_join(distance_aqi_top3 %>% select(city,aqsid,dist),
+            by="city") %>% 
+  left_join(locations_list %>% select(aqsid,station_lat=latitude,station_lon=longitude))
+
+
+
+
+# Pull and Stack all AQI -----------------------------------------------------------
+
+
+days_2020 <- seq(from = as.Date("2020-03-01"),to=as.Date("2020-10-31"),by = 1) %>% 
+  as.tibble() %>% 
+  mutate(
+    url = paste0("https://s3-us-west-1.amazonaws.com//files.airnowtech.org/airnow/2020/",gsub("-","",as.character(value)),"/HourlyAQObs_",gsub("-","",as.character(value)),"23.dat")
+  )
+
+
+
+
+
+
+aqi_day_machine <- function(url){
+  
+  read.table(url,
+             sep = ",",
+             header = TRUE) %>% 
+    clean_names() %>% 
+    return()
+}
+
+
+temp_vector <- days_2020$url
+temp_short <- temp_vector[1:3]
+
+
+aqi_day_data_23 <- lapply(days_2020$url,aqi_day_machine) %>% 
+  bind_rows()
+
+
+# Pull Data for closest three stations ------------------------------------
+
+cities_with_aqi <- cities_with_station_aqi %>% 
+  left_join(aqi_day_data_23 %>% select(aqsid,valid_date,valid_time,ozone_aqi:pm10_unit))
 
 # Write to RDS ------------------------------------------------------------
     
 write_rds(cities_with_station,"cities_with_station.rds")
 write_rds(cities_with_weather,"cities_with_weather.rds")
 write_rds(clean_with_covid,"cities_w_nyt_covid.rds")
+
+write_rds(cities_with_aqi,"cities_with_aqi.rds")
+
+
+temp <- read_rds("cities_w_nyt_covid.rds")
+temp2 <- temp %>% 
+  filter(cases>=100)
+
 
